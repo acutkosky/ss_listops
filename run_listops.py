@@ -5,9 +5,10 @@ import listops_model
 import pickle
 
 
-model_config = listops_model.ModelConfig()
+model_config = listops_model.ModelConfig(d_state=512, scaling=0.001)
 
-train_config = listops_trainer.TrainerConfig()
+train_config = listops_trainer.TrainerConfig(lr=0.0001)
+
 
 
 f = open('save_listops.pkl','rb')

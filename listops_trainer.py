@@ -12,6 +12,8 @@ class TrainerConfig:
     l_max = 2048
     lr = 0.001
 
+    smooth_report = 0.01
+
     def __init__(self, **kwargs):
         for k,v in kwargs.items():
             setattr(self, k,v)
@@ -52,34 +54,37 @@ class Trainer:
 
 
 
+    @torch.no_grad()
     def test_epoch(self):
         test_loader = self.listops.get_dataloader('test')
         pbar = tqdm(enumerate(test_loader), total=len(test_loader))
         running_loss = 0.0
         running_accuracy = 0.0
 
-        for it, (x, targets, lengths) in enumerate(pbar):
+        for it, (x, targets, lengths) in pbar:
 
-            x.to(self.device)  # [B, L]
-            targets.to(self.device) # [B]
-            lengths.to(self.device) # [B]
+            x = x.to(self.device)  # [B, L]
+            targets = targets.to(self.device) # [B]
+            lengths = lengths.to(self.device) # [B]
 
             B, L = x.size()
 
-            logits, probabilities = self.model(x, lengths) # [B, C]
+            logits = self.model(x, lengths) # [B, C]
 
-            loss = F.cross_entropy(probabilities, targets)
+            log_softmax = F.log_softmax(logits, dim=1) # [B, C]
 
-            accuracy = torch.sum(torch.argmax(probabilities, dim=1) == targets)/B
+            loss = F.nll_loss(log_softmax, targets) # [B]
 
-            running_loss += (loss.item - running_loss)/(it+1.0)
-            running_accuracy += (accuracy.item - running_accuracy)/(it+1.0)
+            accuracy = torch.sum(torch.argmax(logits, dim=1) == targets)/B
+
+            running_loss += (loss.item() - running_loss)/(it+1.0)
+            running_accuracy += (accuracy.item() - running_accuracy)/(it+1.0)
 
             pbar.set_description(f"Testing:, running_loss: {running_loss}, running accuracy: {running_accuracy}")
 
         print(f"Test loss: {running_loss}, test accuracy: {running_accuracy}")
 
-    def train_epoch(self, epoch):
+    def train_epoch(self, epoch, smoothing=None):
 
         train_loader = self.listops.get_dataloader('train')
 
@@ -111,15 +116,20 @@ class Trainer:
             loss.backward()
             self.optimizer.step()
 
-            running_loss += (loss.item() - running_loss)/(it+1.0)
-            running_accuracy += (accuracy.item() - running_accuracy)/(it+1.0)
+            averaging_factor = 1.0/(it + 1.0)
+
+            if smoothing is not None:
+                averaging_factor = max(smoothing, averaging_factor)
+
+            running_loss += (loss.item() - running_loss) * averaging_factor
+            running_accuracy += (accuracy.item() - running_accuracy) * averaging_factor
 
             pbar.set_description(f"Epoch: {epoch+1}, running_loss: {running_loss}, running accuracy: {running_accuracy}")
 
 
     def train(self, num_epochs):
         for epoch in range(num_epochs):
-            self.train_epoch(epoch)
+            self.train_epoch(epoch, self.config.smooth_report)
             self.test_epoch()
 
 

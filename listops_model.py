@@ -9,7 +9,7 @@ importlib.reload(fftconv)
 
 class ModelConfig:
 
-    scaling = 0.1
+    scaling = 0.01
     real_init = -0.01
     bidirectional = False
 
