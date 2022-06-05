@@ -2,7 +2,12 @@ import torch
 import numpy as np
 from torch import nn
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
+import opt_einsum as oe
+import math
+
+einsum = contract = oe.contract
+contract_expression = oe.contract_expression
 
 # copied from https://github.com/ag1988/dss/blob/main/src/models/sequence/ss/standalone/dss.py#L199
 def hippo_skew_evals(N):
@@ -14,6 +19,111 @@ def hippo_skew_evals(N):
     evals = torch.linalg.eigvals(Skew)                              # [N]
     # decreasing order of imag
     return evals[evals.imag.argsort(descending=True)]               # [N]
+
+# implementation of dss more faithful to original code. simplified a bit though
+# to remove some options that seem unneeded for good performance.
+# in particular, we may assume:
+# bidirectional is false
+# version is exp
+# initial is hippo_skew_eval
+# there is no "D"
+# channels is 1
+_c2r = torch.view_as_real
+_r2c = torch.view_as_complex
+def get_dss_kernel(frequencies, decays, W, log_dt):
+    Lambda = torch.complex(-torch.exp(decays), frequencies)        # [N]
+    W = _r2c(W)                                                     # [H N]
+    
+    dt_Lambda = _r2c(log_dt.exp().unsqueeze(1) 
+                        * _c2r(Lambda).unsqueeze(0))                    # [H N]
+    
+    P = dt_Lambda.unsqueeze(-1) * torch.arange(L, device=W.device)       # [H N L]
+    
+    S = P.exp()                                                      # [H N L]
+            
+    return einsum('hn,hnl->hl', W, S).float()                   # [H L]
+
+
+class DSS(nn.Module):
+
+    def __init__(self, d_model, d_state, dt_min=0.001, dt_max=0.1, transposed=True):
+        super().__init__()
+
+        self.h = d_model
+        self.n = d_state
+        self.transposed = transposed
+
+        eigvals = hippo_skew_evals(2*self.n)[:self.n].imag
+        self.frequencies = nn.Parameter(eigvals.detach().float())
+        self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(0.5)).float())
+        self.W = nn.Parameter(torch.randn(self.h, self.n, 2))
+
+        # log delta
+        log_dt = math.log(dt_min) + torch.rand(self.h) * (math.log(dt_max) - math.log(dt_min))  # [H]
+        log_dt = log_dt.view(-1,1).tile(2)                          # [H,2]
+        self.log_dt = nn.Parameter(log_dt)
+
+        self.output_linear = nn.Linear(self.h, self.h)
+
+
+    def kernel(self, L):
+        Lambda = torch.complex(-torch.exp(self.decays), self.frequencies)        # [N]
+        W = _r2c(self.W)                                                     # [H N]
+        
+        dt_Lambda = 0.01 * Lambda   # [H, N]
+        dt_Lambda = repeat(dt_Lambda, 'n -> h n', h=self.h)
+        # print("dt lambda shape: ", dt_Lambda.shape)
+        # dt_Lambda = _r2c(self.log_dt.exp().unsqueeze(1) 
+        #                     * _c2r(Lambda).unsqueeze(0))                    # [H N]
+        
+        P = dt_Lambda.unsqueeze(-1) * torch.arange(L, device=W.device)       # [H N L]
+        
+        S = P.exp()                                                      # [H N L]
+                
+        return einsum('hn,hnl->hl', W, S).float()                   # [H L]
+        
+    def forward(self, u):
+
+
+        if not self.transposed: u = u.transpose(-1, -2)
+        L = u.size(-1)
+
+        # Compute SS Kernel
+        # Lk = L if not self.max_kernel_length else min(self.max_kernel_length, L)
+        k = self.kernel(L)  # (H L)
+        
+        # Convolution
+               
+        # y = multiply_polynomials(u.unsqueeze(1), k.unsqueeze(0))[..., :L]  # (B 1 H L), (C 1 H Lk) -> (B C H L)
+        n = 2*L
+        k_f = torch.fft.rfft(k, n=n)  # (H ~n/2)
+        u_f = torch.fft.rfft(u, n=n)  # (B H ~n/2)
+        y_f = contract('bhl,hl->bhl', u_f, k_f) # k_f.unsqueeze(-4) * u_f.unsqueeze(-3) # (B H L)
+        y = torch.fft.irfft(y_f, n=n)[..., :L] # (B H L)
+        
+        
+        # Compute D term in state space equation - essentially a skip connection
+        # y = y + contract('bhl,ch->bchl', u, self.D) # u.unsqueeze(-3) * self.D.unsqueeze(-1)
+
+
+        # Reshape to flatten channels
+        # y = rearrange(y, '... c h l -> ... (c h) l')
+
+        y = F.gelu(y)
+
+        # y = self.dropout(self.activation(y))
+
+        y = y.transpose(-1, -2)  # [B L H]
+
+
+        y = F.gelu(self.output_linear(y)) # [B L H]
+
+        if self.transposed:
+            y = y.transpose(-1, -2)
+        
+
+
+        return y
 
 
 def get_propogator(frequencies, decays):
@@ -54,11 +164,15 @@ class SimpleState(nn.Module):
             assert d_state % 2 == 0, "need even d_state for bidirectional to divide into two directions!"
 
 
-        self.default_initial = nn.Parameter(torch.randn(1, 1, d_state))
-        self.in_projection = nn.Parameter(torch.randn(d_model, d_state) * 0)
+        self.default_initial = nn.Parameter(torch.randn(d_model, d_state))
+        self.in_projection = nn.Parameter(torch.randn(d_model, d_state)) 
         self.out_projection = nn.Parameter(torch.randn(d_state, d_model))
+        # self.in_projection = nn.Parameter(torch.ones(d_model, d_state))  ##FIXFIXFIXFIX
+        # self.out_projection = nn.Parameter(torch.ones(d_state, d_model))  ##FIXFIXFIXFIX
+        # self.default_initial = nn.Parameter(torch.zeros(d_model, d_state)) ##FIXFIXFIXFIX
 
         self.frequencies = hippo_skew_evals(2*d_state)[:d_state].imag
+        # self.frequencies = torch.zeros(d_state)                       # fix fix fix fix
 
         if self.bidirectional:
             # we rearrange the frequencies here to avoid having to rearrange in every
@@ -69,25 +183,26 @@ class SimpleState(nn.Module):
 
         self.frequencies = nn.Parameter(self.frequencies.detach().float() * scaling)
         self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(real_init) * scaling +1e-10)).float())
+        # self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(0.00001) * scaling +1e-10)).float()) ##FIXFIXFIX
 
 
 
 
     def forward(self, input, initial_state=None):
         '''
-        input: B H L if tranposed, B L H otherwise, where B=batch, H=hidden size (i.e. embedding dim)
+        input: B H L if transposed, B L H otherwise, where B=batch, H=hidden size (i.e. embedding dim)
             and L = sequence length
-        initial_state: [B, N]. Starting value for the state (e.g. from
+        initial_state: [B, H, N]. Starting value for the state (e.g. from
             previous block). If set to None, self.default_initial is used
             (this is probably fine in most cases).
             N = size of state representation.
 
-        returns output (same shape as input) and final state [B, N]
+        returns output (same shape as input) and final state [B, H, N]
 
-        Note that final state may not be meaningful if bidirectional=True.
-        In fact, for most scenarios the "final state" can be ignored. It is possibly
+        For most scenarios the "final state" can be ignored. It is possibly
         useful for some streaming type situation though, so we provide it here.
 
+        Note that final state may be especially meaningless if bidirectional=True.
 
         '''
 
@@ -99,17 +214,26 @@ class SimpleState(nn.Module):
 
 
         if initial_state is None:
-            initial_state = self.default_initial.tile((B, 1, 1)) # [B, 1, N]
-        else:
-            initial_state = initial_state.unsqueeze(1) # [B, 1, N]
+            initial_state = self.default_initial.tile((B, 1, 1)) # [B, H, N]
+        # else:
+        initial_state = initial_state.unsqueeze(1) # [B, 1, H, N]
 
-        u = input @ self.in_projection # [B L H] -> [B L N], where N is d_state
+        u = torch.einsum('b l h, h n -> b l h n', input, self.in_projection) # [B L H N]
+        # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_state
 
-        u = torch.cat((initial_state, u), 1) # [B, L+1, H]
+        u_flat = rearrange(u, 'b l h n -> b l (h n)')
+        initial_flat = rearrange(initial_state, 'b l h n -> b l (h n)')
+        u_cat_flat = torch.cat((initial_flat, u_flat), 1) # [B, L+1, H, N]
+
+        # u = torch.cat((initial_state, u), 1) # ([B L H N], [H, N]) -> [B, L+1, H, N]
         kernel_len = L + 1
         if self.bidirectional:
-            u = torch.cat((u, initial_state), 1) # [B, L+2, H]
+            u_cat_flat = torch.cat((u_cat_flat, initial_flat), 1) # [B, L+2, H, N]
             kernel_len = L + 2
+        
+        # print('u shape: ', u.shape)
+        u = rearrange(u_cat_flat, 'b k (h n) -> b h k n', h=H)  # u is now [B H K N]  where K= kernel length
+        #TODO simplify these rearrangements above bit
 
         fft_len = 2 * kernel_len - 1
 
@@ -135,28 +259,37 @@ class SimpleState(nn.Module):
             # Note the ordering (s n) rather than (n s) in the rearrange below important!
             # in __init__ we rearranged the frequencies so that the first and second
             # halves of the frequency list have approximately equally distributed magnitudes.
+            # print("kernel", kernel)
             k_forward, k_backward_flip = rearrange(kernel, 'k (s n) -> s k n', s=2) # 2 tensors both [K, N/2]
             k_forward_pad = F.pad(k_forward, (0, 0, 0, fft_len-kernel_len)) #[fft_len, N/2]
             k_backward_pad_flip = F.pad(k_backward_flip, (0, 0, 0, fft_len-kernel_len)) #[fft_len, N/2]
+            # print("k backward pad flip: ", k_backward_pad_flip)
 
             k_backward_pad = torch.concat((k_backward_pad_flip[0].unsqueeze(0), k_backward_pad_flip[1:, :].flip(0)))
             kernel = torch.concat((k_forward_pad, k_backward_pad), dim=1) #[fft_len, N]
+            # print("final kernel: ", kernel)
 
 
         # we use full fft rather than real fft since we don't constrain our
         # frequencies to be the eigenvalues of a real matrix...
         # we could instead take the real part of the kernel first,
         # but this seems more natural to me.
-        u_f = torch.fft.fft(u, n=fft_len, dim=-2)
-        kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2)
+        # print("u before f: ", u)
+        # print("kernel before f: ", kernel)
+        u_f = torch.fft.fft(u, n=fft_len, dim=-2)  # [B H K N] -> [B H F N] F=fft_len
+        kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2) # [F, N] -> [F, N]
 
-        conv_f = u_f * kernel_f
+        conv_f = u_f * kernel_f # [B H F N] * [F N] -> [B H F N]
 
-        conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, 1:L+1, :]  # [B, L, N] (real)
+        conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, 1:L+1, :]  # [B, H, F, N] -> [B H L N]
 
-        final_state = conv[:, -1, :].unsqueeze(1) # [B, 1, N] -> [B, N]
+        # print("full conv: ", torch.fft.ifft(conv_f, n=fft_len, dim=-2))
 
-        output = conv.real @ self.out_projection     # [B, L, H]
+        final_state = conv[:, :, -1, :].unsqueeze(2) # [B, H, 1, N] -> [B, H, N]
+
+        output = einsum('b h l n, n h -> b l h', conv.real, self.out_projection)
+
+        # output = conv.real @ self.out_projection     # [B, L, H]
 
         if self.transposed:
             output = output.transpose(-2, -1)  #[B, L, H] -> [B, H, L]
@@ -167,7 +300,7 @@ class SimpleState(nn.Module):
     def propogate(self, input, initial_state=None):
         '''
         input: [B, H, L] if transposed, [B, L, H] otherwise
-        initial_state: initial state, [B, N]
+        initial_state: initial state, [B, H, N]
 
         returns
         state sequence (same shape as input)
@@ -187,13 +320,18 @@ class SimpleState(nn.Module):
 
 
         if initial_state is None:
-            initial_state = self.default_initial.tile((B, 1, 1)) # [B, 1, N]
-        else:
-            initial_state = initial_state.unsqueeze(1) # [B, 1, N]
+            initial_state = self.default_initial.tile((B, 1, 1)) # [H, N] -> [B, H, N]
 
-        u = input @ self.in_projection # [B L H] -> [B L N], where N is d_states
+        initial_state = initial_state.unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
+        
+
+        # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_states
+        u = einsum('b l h, h n -> b h l n', input, self.in_projection) # [B H L N], N is d_state, H is input dimension.
 
         propogator = get_propogator(self.frequencies, self.decays) # [N]
+        # print("propogator: ", propogator)
+        # print("u: ", u)
+        # print("initial state: ", initial_state)
 
         def propogate_one_direction(propogator, initial_state, u):
             # I'm sure there is a "right" way to do this, but this is what we're
@@ -202,10 +340,13 @@ class SimpleState(nn.Module):
             current_state = initial_state
             output = []
             for idx in range(L):
-                current_state = current_state * propogator + u[:, idx, :].unsqueeze(1)
-                output.append(current_state.real)
+                propogated_state = current_state * propogator # [B, H, 1, N] * [N] -> [B, H, 1, N]
+                next_input = u[:, :, idx, :].unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
+                current_state = propogated_state + next_input # [B, H, 1, N]
+                output.append(current_state.real.squeeze(2)) # append [B H N]
 
-            output = torch.concat(output, dim=1) # list ([B, 1, N]) -> [B, L, N]
+            output = rearrange(output, 'l b h n -> b h l n') # list ([B, H, 1, N]) -> [B, H, L, N]
+            # torch.concat(output, dim=2)
             return output, current_state
 
         if not self.bidirectional:
@@ -217,31 +358,38 @@ class SimpleState(nn.Module):
             # However, the states are divided by
             propogator_forward = propogator[:self.d_state//2]  # [N/2]
             propogator_backward = propogator[self.d_state//2:] # [N/2]
-            u_forward = u[:, :, :self.d_state//2]              # [B, L, N/2]
-            u_backward = u[:, :, self.d_state//2:]             # [B, L, N/2]
-            u_backward_flip = u_backward.flip(-1)              # [B, L, N/2]
+            u_forward = u[:, :, :, :self.d_state//2]              # [B, H, L, N/2]
+            u_backward = u[:, :, :, self.d_state//2:]             # [B, H, L, N/2]
+            u_backward_flip = u_backward.flip(-2)              # [B, H, L, N/2]
 
-            initial_state_forward = initial_state[:, :, :self.d_state//2] # [1, 1, N/2]
+            initial_state_forward = initial_state[:, :, :, :self.d_state//2] # [B, H, 1, N/2]
 
-            initial_state_backward = initial_state[:, :, self.d_state//2:] # [1, 1, N/2]
+            initial_state_backward = initial_state[:, :, :, self.d_state//2:] # [B, H, 1, N/2]
 
             output_forward, state_forward = propogate_one_direction(propogator_forward,
                                                                     initial_state_forward,
-                                                                    u_forward)  # [B, L, N/2],  [1, 1, N/2]
+                                                                    u_forward)  # [B, H, L, N/2],  [B, H, 1, N/2]
 
             output_backward_flip, _ = propogate_one_direction(propogator_backward,
                                                                     initial_state_backward,
-                                                                    u_backward_flip) # [B, L, N/2],  [1, 1, N/2]
+                                                                    u_backward_flip) # [B, H, L, N/2],  [B, H, 1, N/2]
 
-            output_backward = output_backward_flip.flip(-2)  # [B, L, N/2]
+            output_backward = output_backward_flip.flip(-2)  # [B, H, L, N/2]
+            # output_backward = output_backward.flip(-1)
 
-            output = torch.concat((output_forward, output_backward), -1)  # [B, L, N]
+            output = torch.concat((output_forward, output_backward), -1)  # [B, H, L, N]
 
-            current_state = torch.concat((state_forward, initial_state_backward * propogator_backward), -1) # [1, 1, N]
+            # "final" backward state - actually propogated backward one step from initial backward state...
+            final_state_backward = initial_state_backward * propogator_backward + u_backward_flip[:, :, 0, :].unsqueeze(2)
+            # final_state_backward = final_state_backward.flip(-1)
+
+            current_state = torch.concat((state_forward, final_state_backward), -1) # [B, H, 1, N]
 
 
 
-        output = output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
+        output = einsum('b h l n, n h -> b l h', output, self.out_projection)
+        
+        #output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
 
 
         if self.transposed:
@@ -458,6 +606,21 @@ class DiagAutoCorrelation(nn.Module):
         return multi_way_correlation(*input_convs_list)
 
 
+def test_dss():
+    # just test that it doesn't error
+
+    B = 10
+    H = 15
+    N = 20
+    L = 30
+
+    ss = DSS(H, N, transposed=True)
+    x = torch.randn(B, H, L)
+    y = ss(x)
+
+
+
+
 def test_simplestate():
 
     B = 10
@@ -465,8 +628,15 @@ def test_simplestate():
     N = 20
     L = 30
 
-    ss = SimpleState(H, N)
-    x = torch.randn(B, H, L)
+
+    # B = 1
+    # H = 1
+    # N = 4
+    # L = 3
+
+
+    ss = SimpleState(H, N, transposed=True)
+    x = torch.ones(B, H, L)
 
 
     # these have radically ifferent enough implementations that I'd not expect
@@ -479,18 +649,26 @@ def test_simplestate():
     assert torch.allclose(fft_state, manual_state, atol=1e-4)
 
 
-    ss_bd = SimpleState(H, N, bidirectional=True)
+    ss_bd = SimpleState(H, N, bidirectional=True, transposed=True)
 
     fft_fwd_bd, fft_state_bd = ss_bd(x)
 
     prop_fwd_bd, prop_state_bd  = ss_bd.propogate(x)
 
+    # print("prop fwd: ",prop_fwd_bd)
+    # print("fft fwd: ", fft_fwd_bd)
+
+    # print("prop stat: ",prop_state_bd)
+    # print("fft stat: ", fft_state_bd)
+    # print("diff: ",torch.abs(prop_state_bd-fft_state_bd))
     assert torch.allclose(fft_fwd_bd, prop_fwd_bd, atol=1e-4)
     assert torch.allclose(fft_state_bd, prop_state_bd, atol=1e-4)
 
 # a simple test
 if __name__=='__main__':
 
+
+    test_dss()
 
     test_simplestate()
 
