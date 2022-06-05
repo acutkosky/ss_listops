@@ -10,7 +10,7 @@ def hippo_skew_evals(N):
     i = torch.arange(N, dtype=torch.float)
     x = 2*i + 1
     Hippo = (x.view(-1,1) * x.view(1,-1)).sqrt().tril(diagonal=-1)  # [N N]
-    Skew = (Hippo - Hippo.t()) / 2                                  # [N N] 
+    Skew = (Hippo - Hippo.t()) / 2                                  # [N N]
     evals = torch.linalg.eigvals(Skew)                              # [N]
     # decreasing order of imag
     return evals[evals.imag.argsort(descending=True)]               # [N]
@@ -25,9 +25,10 @@ def get_kernel(frequencies, decays, length):
 
     exponents = exponents.unsqueeze(0).tile((length, 1)) # [N] -> [L, N]
 
-    exponents = exponents * torch.arange(length).unsqueeze(1) # [L, N] * [L, 1] -> [L, N]
+    exponents = exponents * torch.arange(length).unsqueeze(1).to(exponents.device) # [L, N] * [L, 1] -> [L, N]
 
     exponents = exponents.exp()
+    #exponents = exponents/torch.sum(exponents)
 
     return exponents
 
@@ -36,10 +37,10 @@ class SimpleState(nn.Module):
     def __init__(self,
                  d_model,
                  d_state,
-                 real_init=-0.5, 
+                 real_init=-0.5,
                  scaling=1,
                  bidirectional=False,
-                 transposed=True,
+                 transposed=False,
                  **random_other_args # put this in for compatibility with dss code, probably shouldn't have it
                  ):
         super().__init__()
@@ -87,7 +88,7 @@ class SimpleState(nn.Module):
         In fact, for most scenarios the "final state" can be ignored. It is possibly
         useful for some streaming type situation though, so we provide it here.
 
-        
+
         '''
 
         if self.transposed:
@@ -146,10 +147,10 @@ class SimpleState(nn.Module):
         # frequencies to be the eigenvalues of a real matrix...
         # we could instead take the real part of the kernel first,
         # but this seems more natural to me.
-        u_f = torch.fft.fft(u, n=fft_len, dim=-2)                     
-        kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2) 
+        u_f = torch.fft.fft(u, n=fft_len, dim=-2)
+        kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2)
 
-        conv_f = u_f * kernel_f                                  
+        conv_f = u_f * kernel_f
 
         conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, 1:L+1, :]  # [B, L, N] (real)
 
@@ -241,7 +242,7 @@ class SimpleState(nn.Module):
 
 
         output = output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
-        
+
 
         if self.transposed:
             output = output.transpose(-2, -1)  # [B, L, H] -> [B, H, L]
@@ -250,7 +251,7 @@ class SimpleState(nn.Module):
 
 
 
-        
+
 
 
 
@@ -273,7 +274,7 @@ def _paddedfft(input, kernel_size, padding='same'):
     # half the kernel size of zeros.
     # technically, we don't need to pad the endsince the fft function will
     # auto-pad the end for us using the parameter N, but we'll do it anyway.
-    # TODO: find out if padding is an O(N) operation that copies the 
+    # TODO: find out if padding is an O(N) operation that copies the
     # input (seems likely). If so, can we avoid doing it?
     if padding == 'same':
         padding = [(kernel_size - 1) // 2, kernel_size - 1 - (kernel_size - 1) // 2]
@@ -292,7 +293,7 @@ def _paddedfft(input, kernel_size, padding='same'):
     # if the padding is larger than the kernel size, we need to expand the
     # order of the FFT.
     N = L + max(kernel_size - 1, padding[0] + padding[1])
-    
+
     # input_pad = F.pad(input, [(kernel_size-1) // 2 ,0])
     input_f = torch.fft.rfft(input_pad, N)
 
@@ -302,15 +303,15 @@ def _paddedfft(input, kernel_size, padding='same'):
 def fftconv1d(input, weight, bias=None, padding='same'):
     L = input.size(-1)
     kernel_size = weight.size(-1)
-    
+
     input_f, N, padding = _paddedfft(input, kernel_size, padding)
 
 
     # Annoyingly, convolution layers actually compute a cross-correlation
     # rather than an actual convolution. Cross-correlation is convolution
-    # with a time-reversed kernel. 
+    # with a time-reversed kernel.
     # Here 'time-reversed' is NOT the same as simply writing the kernel
-    # backwards: instead, the first coordinate is kept the same but the 
+    # backwards: instead, the first coordinate is kept the same but the
     # rest of the kernel is reversed. Fortunately, the fourier transform of
     # a reversed kernel is the reverse of the fourier transform of the original
     # kernel. For a real-valued kernel, it turns out that the reversed fourier
@@ -333,7 +334,7 @@ def fftconv1d(input, weight, bias=None, padding='same'):
     start = 0
 
     # following code is unnecessary if we pad both the end and the beginning
-    # of input. 
+    # of input.
     # TODO: find out if it's faster not to pad the end of input.
     # if padding == 'same':
     #     end = L
@@ -477,7 +478,7 @@ def test_simplestate():
     assert torch.allclose(fft_forward, manual_forward, atol=1e-4)
     assert torch.allclose(fft_state, manual_state, atol=1e-4)
 
-    
+
     ss_bd = SimpleState(H, N, bidirectional=True)
 
     fft_fwd_bd, fft_state_bd = ss_bd(x)
@@ -513,9 +514,9 @@ if __name__=='__main__':
         tconv.weight = weight
         tconv.bias = bias
         torch_conv = tconv(x)
-        
 
-        
+
+
         # make sure autograd doesn't throw an error...
         assert conv.weight.grad is None
         assert conv.bias.grad is None
@@ -555,7 +556,7 @@ if __name__=='__main__':
 
     # next, let us test the 'prefix' padding mode, which are not
     # available in pytorch. 'prefix' padds only the beginning of input
-    # so as to produce an output of the same length (unlike 'same', which 
+    # so as to produce an output of the same length (unlike 'same', which
     # attempts to pad both beginning and end of input roughly the same
     # amount).
 
