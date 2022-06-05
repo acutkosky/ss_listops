@@ -55,7 +55,7 @@ class SimpleState(nn.Module):
 
 
         self.default_initial = nn.Parameter(torch.randn(1, 1, d_state))
-        self.in_projection = nn.Parameter(torch.randn(d_model, d_state) * 0)
+        self.in_projection = nn.Parameter(torch.randn(d_model, d_state))
         self.out_projection = nn.Parameter(torch.randn(d_state, d_model))
 
         self.frequencies = hippo_skew_evals(2*d_state)[:d_state].imag
