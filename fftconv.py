@@ -151,6 +151,7 @@ class SimpleState(nn.Module):
                  scaling=1,
                  bidirectional=False,
                  transposed=False,
+                 do_output_state=True,
                  **random_other_args # put this in for compatibility with dss code, probably shouldn't have it
                  ):
         super().__init__()
@@ -159,6 +160,8 @@ class SimpleState(nn.Module):
         self.d_state = d_state
         self.transposed = transposed
         self.bidirectional = bidirectional
+
+        self.do_output_state = do_output_state
 
         if self.bidirectional:
             assert d_state % 2 == 0, "need even d_state for bidirectional to divide into two directions!"
@@ -218,22 +221,12 @@ class SimpleState(nn.Module):
         # else:
         initial_state = initial_state.unsqueeze(1) # [B, 1, H, N]
 
-        u = torch.einsum('b l h, h n -> b l h n', input, self.in_projection) # [B L H N]
-        # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_state
 
-        u_flat = rearrange(u, 'b l h n -> b l (h n)')
-        initial_flat = rearrange(initial_state, 'b l h n -> b l (h n)')
-        u_cat_flat = torch.cat((initial_flat, u_flat), 1) # [B, L+1, H, N]
-
-        # u = torch.cat((initial_state, u), 1) # ([B L H N], [H, N]) -> [B, L+1, H, N]
-        kernel_len = L + 1
-        if self.bidirectional:
-            u_cat_flat = torch.cat((u_cat_flat, initial_flat), 1) # [B, L+2, H, N]
-            kernel_len = L + 2
-        
-        # print('u shape: ', u.shape)
-        u = rearrange(u_cat_flat, 'b k (h n) -> b h k n', h=H)  # u is now [B H K N]  where K= kernel length
-        #TODO simplify these rearrangements above bit
+        # if self.bidirectional:
+        #     kernel_len = L + 2
+        # else:
+        #     kernel_len = L + 1
+        kernel_len = L
 
         fft_len = 2 * kernel_len - 1
 
@@ -270,24 +263,66 @@ class SimpleState(nn.Module):
             # print("final kernel: ", kernel)
 
 
+
+
+        if self.do_output_state:
+            kernel = kernel.unsqueeze(0)
+            u = einsum('b l h, h n -> b l h n', input, self.in_projection) # [B L H N]
+            # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_state
+
+            # u_flat = rearrange(u, 'b l h n -> b l (h n)')
+            # initial_flat = rearrange(initial_state, 'b l h n -> b l (h n)')
+            # u_cat_flat = torch.cat((initial_flat, u_flat), 1) # [B, L+1, H, N]
+
+            # # u = torch.cat((initial_state, u), 1) # ([B L H N], [H, N]) -> [B, L+1, H, N]
+            # if self.bidirectional:
+            #     u_cat_flat = torch.cat((u_cat_flat, initial_flat), 1) # [B, L+2, H, N]
+
+            # # print('u shape: ', u.shape)
+            # u = rearrange(u_cat_flat, 'b k (h n) -> b h k n', h=H)  # u is now [B H K N]  where K= kernel length
+            u = rearrange(u, 'b l h n -> b h l n')
+            #TODO simplify these rearrangements above bit
+
+        else:
+            # if we don't care to output the states, then we can pre-multiply the kernel by the
+            # input and output projections to save memory in the fft.
+            complex_in = self.in_projection + 0j
+            complex_out = self.out_projection + 0j
+            kernel = einsum('h n, k n, n h -> h k', complex_in, kernel, complex_out)
+            kernel = kernel.unsqueeze(-1) # [h k 1]
+            kernel = kernel.real
+            
+            # we also don't need to expand u
+            u = input.unsqueeze(-1) # [B L H] -> [B L H 1]
+            u = rearrange(u, 'b l h s -> b h l s') # [B L H 1] -> [B H L 1]
+        
+
+
         # we use full fft rather than real fft since we don't constrain our
         # frequencies to be the eigenvalues of a real matrix...
         # we could instead take the real part of the kernel first,
-        # but this seems more natural to me.
+        # but this will allow us to propogate the state as well as the output since
+        # the state is imaginary.
         # print("u before f: ", u)
         # print("kernel before f: ", kernel)
-        u_f = torch.fft.fft(u, n=fft_len, dim=-2)  # [B H K N] -> [B H F N] F=fft_len
-        kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2) # [F, N] -> [F, N]
+        u_f = torch.fft.fft(u, n=fft_len, dim=-2)  # [B H K N] -> [B H F N] F=fft_len OR [B H F 1] -> [B H F 1]
+        kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2) # [1 F N] -> [1 F N] OR [H F 1] -> [H F 1]
 
-        conv_f = u_f * kernel_f # [B H F N] * [F N] -> [B H F N]
+        conv_f = u_f * kernel_f # [B H F N] * [1 F N] -> [B H F N] OR [B H F 1] * [H F 1] -> [B H F 1]
 
-        conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, 1:L+1, :]  # [B, H, F, N] -> [B H L N]
+        # conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, 1:L+1, :]  # [B, H, F, N] -> [B H L N]
+        conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, 0:L, :]  # [B, H, F, N] -> [B H L N] OR [B H F 1] -> [B H L 1]
 
         # print("full conv: ", torch.fft.ifft(conv_f, n=fft_len, dim=-2))
 
-        final_state = conv[:, :, -1, :].unsqueeze(2) # [B, H, 1, N] -> [B, H, N]
-
-        output = einsum('b h l n, n h -> b l h', conv.real, self.out_projection)
+        if self.do_output_state:
+            final_state = conv[:, :, -1, :].unsqueeze(2) # [B, H, 1, N] -> [B, H, N]
+            complex_out = self.out_projection + 0j
+            output = einsum('b h l n, n h -> b l h', conv, complex_out).real
+        else:
+            final_state = None
+            output = conv.squeeze(-1) # [B H L 1] -> [B H L]
+            output = rearrange(output, 'b h l -> b l h').real
 
         # output = conv.real @ self.out_projection     # [B, L, H]
 
@@ -337,13 +372,13 @@ class SimpleState(nn.Module):
             # I'm sure there is a "right" way to do this, but this is what we're
             # doing right now because I never really got the hand of not
             # using for loops...
-            current_state = initial_state
+            current_state = 0.0#initial_state
             output = []
             for idx in range(L):
                 propogated_state = current_state * propogator # [B, H, 1, N] * [N] -> [B, H, 1, N]
                 next_input = u[:, :, idx, :].unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
                 current_state = propogated_state + next_input # [B, H, 1, N]
-                output.append(current_state.real.squeeze(2)) # append [B H N]
+                output.append(current_state.squeeze(2)) # append [B H N]
 
             output = rearrange(output, 'l b h n -> b h l n') # list ([B, H, 1, N]) -> [B, H, L, N]
             # torch.concat(output, dim=2)
@@ -352,14 +387,15 @@ class SimpleState(nn.Module):
         if not self.bidirectional:
             output, current_state = propogate_one_direction(propogator, initial_state, u)
         else:
-            # This part is a bit annoying: in the fft-based function,
-            # we divide the propogator into forward and backward frequencies
-            # by taking every other frequency.
-            # However, the states are divided by
+            # This part is a bit annoying: we need to divide up the state between
+            # forward and backward components, propogate in different directions,
+            # and then stitch everything together.
             propogator_forward = propogator[:self.d_state//2]  # [N/2]
             propogator_backward = propogator[self.d_state//2:] # [N/2]
             u_forward = u[:, :, :, :self.d_state//2]              # [B, H, L, N/2]
             u_backward = u[:, :, :, self.d_state//2:]             # [B, H, L, N/2]
+
+            # we'll handle backward propogation by reversing u and doing forward propogation.
             u_backward_flip = u_backward.flip(-2)              # [B, H, L, N/2]
 
             initial_state_forward = initial_state[:, :, :, :self.d_state//2] # [B, H, 1, N/2]
@@ -375,19 +411,17 @@ class SimpleState(nn.Module):
                                                                     u_backward_flip) # [B, H, L, N/2],  [B, H, 1, N/2]
 
             output_backward = output_backward_flip.flip(-2)  # [B, H, L, N/2]
-            # output_backward = output_backward.flip(-1)
 
             output = torch.concat((output_forward, output_backward), -1)  # [B, H, L, N]
 
             # "final" backward state - actually propogated backward one step from initial backward state...
-            final_state_backward = initial_state_backward * propogator_backward + u_backward_flip[:, :, 0, :].unsqueeze(2)
-            # final_state_backward = final_state_backward.flip(-1)
+            final_state_backward = 0.0 * initial_state_backward * propogator_backward + u_backward_flip[:, :, 0, :].unsqueeze(2)
 
             current_state = torch.concat((state_forward, final_state_backward), -1) # [B, H, 1, N]
 
 
-
-        output = einsum('b h l n, n h -> b l h', output, self.out_projection)
+        complex_out = self.out_projection + 0j
+        output = einsum('b h l n, n h -> b l h', output, complex_out).real
         
         #output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
 
@@ -648,6 +682,11 @@ def test_simplestate():
     assert torch.allclose(fft_forward, manual_forward, atol=1e-4)
     assert torch.allclose(fft_state, manual_state, atol=1e-4)
 
+    ss.do_output_state = False
+    fft_forward_no_state, _ = ss(x)
+
+    assert torch.allclose(fft_forward, fft_forward_no_state, atol=1e-4)
+
 
     ss_bd = SimpleState(H, N, bidirectional=True, transposed=True)
 
@@ -663,6 +702,13 @@ def test_simplestate():
     # print("diff: ",torch.abs(prop_state_bd-fft_state_bd))
     assert torch.allclose(fft_fwd_bd, prop_fwd_bd, atol=1e-4)
     assert torch.allclose(fft_state_bd, prop_state_bd, atol=1e-4)
+
+    ss_bd.do_output_state = False
+    fft_fwd_bd_no_state, _ = ss_bd(x)
+
+    assert torch.allclose(fft_fwd_bd, fft_fwd_bd_no_state, atol=1e-4)
+
+    
 
 # a simple test
 if __name__=='__main__':
