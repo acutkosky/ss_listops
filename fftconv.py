@@ -168,13 +168,13 @@ class GatedStateUnit(nn.Module):
         if self.transposed:
             x = x.transpose(-2, -1)
         gate = F.gelu(self.gate_linear(x))
-        state_space, _ = self.state_space_layer(x)
+        state_space, final_state = self.state_space_layer(x)
         result = self.final_linear(gate * state_space)
 
         if self.transposed:
             result = result.transpose(-2, -1)
 
-        return result
+        return result, final_state
 
 
 class SimpleState(nn.Module):
