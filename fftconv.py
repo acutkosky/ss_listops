@@ -361,7 +361,7 @@ class SimpleState(nn.Module):
 
 
         if initial_state is None:
-            initial_state = 0.0
+            initial_state = torch.zeros((B, H, 1, self.d_state))
         #self.default_initial.tile((B, 1, 1)) # [H, N] -> [B, H, N]
         else:
             initial_state = initial_state.unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
