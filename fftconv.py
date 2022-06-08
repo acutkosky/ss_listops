@@ -33,14 +33,14 @@ _r2c = torch.view_as_complex
 def get_dss_kernel(frequencies, decays, W, log_dt):
     Lambda = torch.complex(-torch.exp(decays), frequencies)        # [N]
     W = _r2c(W)                                                     # [H N]
-    
-    dt_Lambda = _r2c(log_dt.exp().unsqueeze(1) 
+
+    dt_Lambda = _r2c(log_dt.exp().unsqueeze(1)
                         * _c2r(Lambda).unsqueeze(0))                    # [H N]
-    
+
     P = dt_Lambda.unsqueeze(-1) * torch.arange(L, device=W.device)       # [H N L]
-    
+
     S = P.exp()                                                      # [H N L]
-            
+
     return einsum('hn,hnl->hl', W, S).float()                   # [H L]
 
 
@@ -69,19 +69,19 @@ class DSS(nn.Module):
     def kernel(self, L):
         Lambda = torch.complex(-torch.exp(self.decays), self.frequencies)        # [N]
         W = _r2c(self.W)                                                     # [H N]
-        
+
         dt_Lambda = 0.01 * Lambda   # [H, N]
         dt_Lambda = repeat(dt_Lambda, 'n -> h n', h=self.h)
         # print("dt lambda shape: ", dt_Lambda.shape)
-        # dt_Lambda = _r2c(self.log_dt.exp().unsqueeze(1) 
+        # dt_Lambda = _r2c(self.log_dt.exp().unsqueeze(1)
         #                     * _c2r(Lambda).unsqueeze(0))                    # [H N]
-        
+
         P = dt_Lambda.unsqueeze(-1) * torch.arange(L, device=W.device)       # [H N L]
-        
+
         S = P.exp()                                                      # [H N L]
-                
+
         return einsum('hn,hnl->hl', W, S).float()                   # [H L]
-        
+
     def forward(self, u):
 
 
@@ -91,17 +91,17 @@ class DSS(nn.Module):
         # Compute SS Kernel
         # Lk = L if not self.max_kernel_length else min(self.max_kernel_length, L)
         k = self.kernel(L)  # (H L)
-        
+
         # Convolution
-               
+
         # y = multiply_polynomials(u.unsqueeze(1), k.unsqueeze(0))[..., :L]  # (B 1 H L), (C 1 H Lk) -> (B C H L)
         n = 2*L
         k_f = torch.fft.rfft(k, n=n)  # (H ~n/2)
         u_f = torch.fft.rfft(u, n=n)  # (B H ~n/2)
         y_f = contract('bhl,hl->bhl', u_f, k_f) # k_f.unsqueeze(-4) * u_f.unsqueeze(-3) # (B H L)
         y = torch.fft.irfft(y_f, n=n)[..., :L] # (B H L)
-        
-        
+
+
         # Compute D term in state space equation - essentially a skip connection
         # y = y + contract('bhl,ch->bchl', u, self.D) # u.unsqueeze(-3) * self.D.unsqueeze(-1)
 
@@ -120,18 +120,21 @@ class DSS(nn.Module):
 
         if self.transposed:
             y = y.transpose(-1, -2)
-        
 
 
-        return y
+
+        return y, None
 
 
 def get_propogator(frequencies, decays):
+    frequencies = frequencies * 2 * torch.pi
     exponents = torch.complex(-torch.exp(decays), frequencies)
     return torch.exp(exponents)
 
-def get_kernel(frequencies, decays, length):
-    exponents = torch.complex(-torch.exp(decays), frequencies)
+def get_kernel(frequencies, decays, length, scaling):
+    frequencies = frequencies * 2 * torch.pi
+    decays = -torch.exp(decays)
+    exponents = torch.complex(decays, frequencies)
 
     exponents = exponents.unsqueeze(0).tile((length, 1)) # [N] -> [L, N]
 
@@ -168,13 +171,16 @@ class SimpleState(nn.Module):
 
 
         self.default_initial = nn.Parameter(torch.randn(d_model, d_state))
-        self.in_projection = nn.Parameter(torch.randn(d_model, d_state)) 
+        self.in_projection = nn.Parameter(torch.randn(d_model, d_state))
         self.out_projection = nn.Parameter(torch.randn(d_state, d_model))
         # self.in_projection = nn.Parameter(torch.ones(d_model, d_state))  ##FIXFIXFIXFIX
         # self.out_projection = nn.Parameter(torch.ones(d_state, d_model))  ##FIXFIXFIXFIX
         # self.default_initial = nn.Parameter(torch.zeros(d_model, d_state)) ##FIXFIXFIXFIX
 
-        self.frequencies = hippo_skew_evals(2*d_state)[:d_state].imag
+        self.frequencies = torch.rand(d_star) #hippo_skew_evals(2*d_state)[:d_state].imag
+        self.scaling = nn.Parameter(torch.ones_like(self.frequencies) * scaling)
+        #self.frequencies = self.frequencies * scaling
+        #self.frequencies = -torch.log(1.0/torch.rand(d_state)-1)
         # self.frequencies = torch.zeros(d_state)                       # fix fix fix fix
 
         if self.bidirectional:
@@ -184,8 +190,8 @@ class SimpleState(nn.Module):
             f_0, f_1 = rearrange(self.frequencies, '(n s) -> s n', s=2)
             self.frequencies = torch.concat((f_0, f_1))
 
-        self.frequencies = nn.Parameter(self.frequencies.detach().float() * scaling)
-        self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(real_init) * scaling +1e-10)).float())
+        self.frequencies = nn.Parameter(self.frequencies.detach().float())
+        self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(real_init) +1e-10)).float())
         # self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(0.00001) * scaling +1e-10)).float()) ##FIXFIXFIX
 
 
@@ -230,7 +236,7 @@ class SimpleState(nn.Module):
 
         fft_len = 2 * kernel_len - 1
 
-        kernel = get_kernel(self.frequencies, self.decays, kernel_len) # [K, N] (complex) K=L+1 or L+2
+        kernel = get_kernel(self.frequencies, self.decays, kernel_len, self.scaling) # [K, N] (complex) K=L+1 or L+2
 
         if self.bidirectional:
             # this is a bit tricky: we don't actually want to simply reverse
@@ -291,11 +297,11 @@ class SimpleState(nn.Module):
             kernel = einsum('h n, k n, n h -> h k', complex_in, kernel, complex_out)
             kernel = kernel.unsqueeze(-1) # [h k 1]
             kernel = kernel.real
-            
+
             # we also don't need to expand u
             u = input.unsqueeze(-1) # [B L H] -> [B L H 1]
             u = rearrange(u, 'b l h s -> b h l s') # [B L H 1] -> [B H L 1]
-        
+
 
 
         # we use full fft rather than real fft since we don't constrain our
@@ -358,7 +364,7 @@ class SimpleState(nn.Module):
             initial_state = self.default_initial.tile((B, 1, 1)) # [H, N] -> [B, H, N]
 
         initial_state = initial_state.unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
-        
+
 
         # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_states
         u = einsum('b l h, h n -> b h l n', input, self.in_projection) # [B H L N], N is d_state, H is input dimension.
@@ -422,7 +428,7 @@ class SimpleState(nn.Module):
 
         complex_out = self.out_projection + 0j
         output = einsum('b h l n, n h -> b l h', output, complex_out).real
-        
+
         #output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
 
 
@@ -708,7 +714,7 @@ def test_simplestate():
 
     assert torch.allclose(fft_fwd_bd, fft_fwd_bd_no_state, atol=1e-4)
 
-    
+
 
 # a simple test
 if __name__=='__main__':
