@@ -221,18 +221,27 @@ class SimpleState(nn.Module):
         # input is now B L H
         B, L, H = input.size()
 
+        assert(initial_state is None or not self.do_output_state, "providing an initial_state is incompatible with skipping state output")
+        # TODO this shouldn't actually be incompatible...
 
-        if initial_state is None:
-            initial_state = self.default_initial.tile((B, 1, 1)) # [B, H, N]
-        # else:
-        initial_state = initial_state.unsqueeze(1) # [B, 1, H, N]
+        # if initial_state is None:
+        #     initial_state = self.default_initial.tile((B, 1, 1)) # [B, H, N]
+        # # else:
+        if initial_state is not None:
+            initial_state = rearrange(initial_state, 'b (l h) n -> b l h n', l=1)
 
 
         # if self.bidirectional:
         #     kernel_len = L + 2
         # else:
         #     kernel_len = L + 1
-        kernel_len = L
+        if initial_state is not None:
+            if self.bidirectional:
+                kernel_len = L + 2 # unclear what initial state should really mean in this case, but we'll just stick it at both ends.
+            else:
+                kernel_len = L + 1
+        else:
+            kernel_len = L
 
         fft_len = 2 * kernel_len - 1
 
@@ -276,17 +285,19 @@ class SimpleState(nn.Module):
             u = einsum('b l h, h n -> b l h n', input, self.in_projection) # [B L H N]
             # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_state
 
-            # u_flat = rearrange(u, 'b l h n -> b l (h n)')
-            # initial_flat = rearrange(initial_state, 'b l h n -> b l (h n)')
-            # u_cat_flat = torch.cat((initial_flat, u_flat), 1) # [B, L+1, H, N]
+            if initial_state is not None:
+                u_flat = rearrange(u, 'b l h n -> b l (h n)')
+                initial_flat = rearrange(initial_state, 'b l h n -> b l (h n)')
+                u_cat_flat = torch.cat((initial_flat, u_flat), 1) # [B, L+1, H, N]
 
-            # # u = torch.cat((initial_state, u), 1) # ([B L H N], [H, N]) -> [B, L+1, H, N]
-            # if self.bidirectional:
-            #     u_cat_flat = torch.cat((u_cat_flat, initial_flat), 1) # [B, L+2, H, N]
+                # u = torch.cat((initial_state, u), 1) # ([B L H N], [H, N]) -> [B, L+1, H, N]
+                if self.bidirectional:
+                    u_cat_flat = torch.cat((u_cat_flat, initial_flat), 1) # [B, L+2, H, N]
 
-            # # print('u shape: ', u.shape)
-            # u = rearrange(u_cat_flat, 'b k (h n) -> b h k n', h=H)  # u is now [B H K N]  where K= kernel length
-            u = rearrange(u, 'b l h n -> b h l n')
+                # print('u shape: ', u.shape)
+                u = rearrange(u_cat_flat, 'b k (h n) -> b h k n', h=H)  # u is now [B H K N]  where K= kernel length
+            else:
+                u = rearrange(u, 'b l h n -> b h l n')
             #TODO simplify these rearrangements above bit
 
         else:
@@ -317,7 +328,11 @@ class SimpleState(nn.Module):
         conv_f = u_f * kernel_f # [B H F N] * [1 F N] -> [B H F N] OR [B H F 1] * [H F 1] -> [B H F 1]
 
         # conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, 1:L+1, :]  # [B, H, F, N] -> [B H L N]
-        conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, 0:L, :]  # [B, H, F, N] -> [B H L N] OR [B H F 1] -> [B H L 1]
+        if initial_state is not None:
+            start = 1
+        else:
+            start = 0
+        conv = torch.fft.ifft(conv_f, n=fft_len, dim=-2)[:, :, start:start + L, :]  # [B, H, F, N] -> [B H L N] OR [B H F 1] -> [B H L 1]
 
         # print("full conv: ", torch.fft.ifft(conv_f, n=fft_len, dim=-2))
 
@@ -422,7 +437,7 @@ class SimpleState(nn.Module):
             output = torch.concat((output_forward, output_backward), -1)  # [B, H, L, N]
 
             # "final" backward state - actually propogated backward one step from initial backward state...
-            final_state_backward = 0.0 * initial_state_backward * propogator_backward + u_backward_flip[:, :, 0, :].unsqueeze(2)
+            final_state_backward = initial_state_backward * propogator_backward + u_backward_flip[:, :, 0, :].unsqueeze(2)
 
             current_state = torch.concat((state_forward, final_state_backward), -1) # [B, H, 1, N]
 
@@ -669,6 +684,7 @@ def test_simplestate():
     N = 20
     L = 30
 
+    initial_state = torch.randn((B, H, N))
 
     # B = 1
     # H = 1
@@ -682,6 +698,13 @@ def test_simplestate():
 
     # these have radically ifferent enough implementations that I'd not expect
     # them to agree unless both were correct...
+    fft_forward, fft_state = ss(x, initial_state)
+    manual_forward, manual_state = ss.propogate(x, initial_state)
+
+
+    assert torch.allclose(fft_forward, manual_forward, atol=1e-4)
+    assert torch.allclose(fft_state, manual_state, atol=1e-4)
+
     fft_forward, fft_state = ss(x)
     manual_forward, manual_state = ss.propogate(x)
 
@@ -696,6 +719,19 @@ def test_simplestate():
 
 
     ss_bd = SimpleState(H, N, bidirectional=True, transposed=True)
+
+    fft_fwd_bd, fft_state_bd = ss_bd(x, initial_state)
+
+    prop_fwd_bd, prop_state_bd  = ss_bd.propogate(x, initial_state)
+
+    # print("prop fwd: ",prop_fwd_bd)
+    # print("fft fwd: ", fft_fwd_bd)
+
+    # print("prop stat: ",prop_state_bd)
+    # print("fft stat: ", fft_state_bd)
+    # print("diff: ",torch.abs(prop_state_bd-fft_state_bd))
+    assert torch.allclose(fft_fwd_bd, prop_fwd_bd, atol=1e-4)
+    assert torch.allclose(fft_state_bd, prop_state_bd, atol=1e-4)
 
     fft_fwd_bd, fft_state_bd = ss_bd(x)
 
