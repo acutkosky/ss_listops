@@ -145,6 +145,37 @@ def get_kernel(frequencies, decays, length, scaling):
 
     return exponents
 
+class GatedStateUnit(nn.Module):
+    def __init__(self,
+                 d_embed,
+                 d_state,
+                 transposed=False,
+                 do_output_state=False,
+                 **simple_state_args):
+
+        super().__init__()
+
+        self.d_embed = d_embed
+        self.d_state = d_state
+        self.transposed = transposed
+
+        self.gate_linear = torch.nn.Linear(d_embed, d_embed)
+        self.state_space_layer = SimpleState(d_embed, d_state, transposed=False, do_output_state=False, **simple_state_args)
+
+        self.final_linear = torch.nn.Linear(d_embed, d_embed)
+
+    def forward(self, x):
+        if self.transposed:
+            x = x.transpose(-2, -1)
+        gate = F.gelu(self.gate_linear(x))
+        state_space, _ = self.state_space_layer(x)
+        result = self.final_linear(gate * state_space)
+
+        if self.transposed:
+            result = result.transpose(-2, -1)
+
+        return result
+
 
 class SimpleState(nn.Module):
     def __init__(self,
@@ -152,6 +183,9 @@ class SimpleState(nn.Module):
                  d_state,
                  real_init=-0.5,
                  scaling=1,
+                 init_freq_max=100,
+                 init_freq_min=0.01,
+                 do_final_linear=True,
                  bidirectional=False,
                  transposed=False,
                  do_output_state=True,
@@ -163,6 +197,7 @@ class SimpleState(nn.Module):
         self.d_state = d_state
         self.transposed = transposed
         self.bidirectional = bidirectional
+        self.do_final_linear = do_final_linear
 
         self.do_output_state = do_output_state
 
@@ -176,8 +211,9 @@ class SimpleState(nn.Module):
         # self.in_projection = nn.Parameter(torch.ones(d_model, d_state))  ##FIXFIXFIXFIX
         # self.out_projection = nn.Parameter(torch.ones(d_state, d_model))  ##FIXFIXFIXFIX
         # self.default_initial = nn.Parameter(torch.zeros(d_model, d_state)) ##FIXFIXFIXFIX
-
-        self.frequencies = torch.rand(d_state)/scaling #hippo_skew_evals(2*d_state)[:d_state].imag
+        init_log_freq_range = np.log(init_freq_max) - np.log(init_freq_min)
+        init_log_freq_min = np.log(init_freq_min)
+        self.frequencies = torch.exp(torch.rand(d_state) * init_log_freq_range+init_log_freq_min)/scaling #hippo_skew_evals(2*d_state)[:d_state].imag
         self.scaling = scaling#nn.Parameter(torch.ones_like(self.frequencies) * scaling)
         #self.frequencies = self.frequencies * scaling
         #self.frequencies = -torch.log(1.0/torch.rand(d_state)-1)
@@ -194,7 +230,8 @@ class SimpleState(nn.Module):
         self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(real_init) +1e-10)).float())
         # self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(0.00001) * scaling +1e-10)).float()) ##FIXFIXFIX
 
-
+        if do_final_linear:
+            self.final_linear = nn.Linear(d_model, d_model)
 
 
     def forward(self, input, initial_state=None):
@@ -347,9 +384,13 @@ class SimpleState(nn.Module):
 
         # output = conv.real @ self.out_projection     # [B, L, H]
 
+        if self.do_final_linear:
+            output = F.gelu(self.final_linear(output))
+
         if self.transposed:
             output = output.transpose(-2, -1)  #[B, L, H] -> [B, H, L]
 
+        
         return output, final_state
 
 
@@ -447,6 +488,8 @@ class SimpleState(nn.Module):
 
         #output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
 
+        if self.do_final_linear:
+            output = F.gelu(self.final_linear(output))
 
         if self.transposed:
             output = output.transpose(-2, -1)  # [B, L, H] -> [B, H, L]
@@ -662,7 +705,7 @@ class DiagAutoCorrelation(nn.Module):
         return multi_way_correlation(*input_convs_list)
 
 
-def test_dss():
+def test_no_error():
     # just test that it doesn't error
 
     B = 10
@@ -673,6 +716,9 @@ def test_dss():
     ss = DSS(H, N, transposed=True)
     x = torch.randn(B, H, L)
     y = ss(x)
+
+    gated = GatedStateUnit(H, N, transposed=True)
+    y = gated(x)
 
 
 
@@ -757,7 +803,7 @@ def test_simplestate():
 if __name__=='__main__':
 
 
-    test_dss()
+    test_no_error()
 
     test_simplestate()
 
