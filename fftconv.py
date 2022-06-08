@@ -46,12 +46,13 @@ def get_dss_kernel(frequencies, decays, W, log_dt):
 
 class DSS(nn.Module):
 
-    def __init__(self, d_model, d_state, dt_min=0.001, dt_max=0.1, transposed=True):
+    def __init__(self, d_model, d_state, dt_min=0.001, dt_max=0.1, transposed=True, do_final_linear=True):
         super().__init__()
 
         self.h = d_model
         self.n = d_state
         self.transposed = transposed
+        self.do_final_linear = do_final_linear
 
         eigvals = hippo_skew_evals(2*self.n)[:self.n].imag
         self.frequencies = nn.Parameter(eigvals.detach().float())
@@ -63,14 +64,15 @@ class DSS(nn.Module):
         log_dt = log_dt.view(-1,1).tile(2)                          # [H,2]
         self.log_dt = nn.Parameter(log_dt)
 
-        self.output_linear = nn.Linear(self.h, self.h)
+        if self.do_final_linear:
+            self.final_linear = nn.Linear(self.h, self.h)
 
 
     def kernel(self, L):
         Lambda = torch.complex(-torch.exp(self.decays), self.frequencies)        # [N]
         W = _r2c(self.W)                                                     # [H N]
 
-        dt_Lambda = 0.01 * Lambda   # [H, N]
+        dt_Lambda = Lambda#0.01 * Lambda   # [H, N]
         dt_Lambda = repeat(dt_Lambda, 'n -> h n', h=self.h)
         # print("dt lambda shape: ", dt_Lambda.shape)
         # dt_Lambda = _r2c(self.log_dt.exp().unsqueeze(1)
@@ -79,6 +81,7 @@ class DSS(nn.Module):
         P = dt_Lambda.unsqueeze(-1) * torch.arange(L, device=W.device)       # [H N L]
 
         S = P.exp()                                                      # [H N L]
+
 
         return einsum('hn,hnl->hl', W, S).float()                   # [H L]
 
@@ -109,14 +112,15 @@ class DSS(nn.Module):
         # Reshape to flatten channels
         # y = rearrange(y, '... c h l -> ... (c h) l')
 
-        y = F.gelu(y)
+
 
         # y = self.dropout(self.activation(y))
 
         y = y.transpose(-1, -2)  # [B L H]
 
-
-        y = F.gelu(self.output_linear(y)) # [B L H]
+        if self.do_final_linear:
+            y = F.gelu(y)
+            y = F.gelu(self.final_linear(y)) # [B L H]
 
         if self.transposed:
             y = y.transpose(-1, -2)
@@ -127,12 +131,12 @@ class DSS(nn.Module):
 
 
 def get_propogator(frequencies, decays, scaling):
-    frequencies = frequencies * 2 * torch.pi * scaling
+    frequencies = frequencies * scaling
     exponents = torch.complex(-torch.exp(decays), frequencies)
     return torch.exp(exponents)
 
 def get_kernel(frequencies, decays, length, scaling):
-    frequencies = frequencies * 2 * torch.pi * scaling
+    frequencies = frequencies * scaling
     decays = -torch.exp(decays) * scaling
     exponents = torch.complex(decays, frequencies)
 
@@ -183,6 +187,8 @@ class SimpleState(nn.Module):
                  d_state,
                  real_init=-0.5,
                  scaling=1,
+                 freq_init_mode='random',
+                 train_in_proj=False,
                  init_freq_max=100,
                  init_freq_min=0.01,
                  do_final_linear=True,
@@ -206,14 +212,22 @@ class SimpleState(nn.Module):
 
 
         self.default_initial = nn.Parameter(torch.randn(d_model, d_state))
-        self.in_projection = nn.Parameter(torch.randn(d_model, d_state))
-        self.out_projection = nn.Parameter(torch.randn(d_state, d_model))
+
+        if train_in_proj:
+            self.in_projection = nn.Parameter(_c2r(torch.ones(d_model, d_state) + 0j))
+        else:
+            self.in_projection = _c2r(torch.ones(d_model, d_state) + 0j)
+    
+        self.out_projection = nn.Parameter(torch.randn(d_state, d_model, 2))
         # self.in_projection = nn.Parameter(torch.ones(d_model, d_state))  ##FIXFIXFIXFIX
         # self.out_projection = nn.Parameter(torch.ones(d_state, d_model))  ##FIXFIXFIXFIX
         # self.default_initial = nn.Parameter(torch.zeros(d_model, d_state)) ##FIXFIXFIXFIX
-        init_log_freq_range = np.log(init_freq_max) - np.log(init_freq_min)
-        init_log_freq_min = np.log(init_freq_min)
-        self.frequencies = torch.exp(torch.rand(d_state) * init_log_freq_range+init_log_freq_min)/scaling #hippo_skew_evals(2*d_state)[:d_state].imag
+        if freq_init_mode == 'random':
+            init_log_freq_range = np.log(init_freq_max) - np.log(init_freq_min)
+            init_log_freq_min = np.log(init_freq_min)
+            self.frequencies = torch.exp(torch.rand(d_state) * init_log_freq_range+init_log_freq_min)/scaling
+        else:
+            self.frequencies = hippo_skew_evals(2*d_state)[:d_state].imag
         self.scaling = scaling#nn.Parameter(torch.ones_like(self.frequencies) * scaling)
         #self.frequencies = self.frequencies * scaling
         #self.frequencies = -torch.log(1.0/torch.rand(d_state)-1)
@@ -227,7 +241,7 @@ class SimpleState(nn.Module):
             self.frequencies = torch.concat((f_0, f_1))
 
         self.frequencies = nn.Parameter(self.frequencies.detach().float())
-        self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(real_init) +1e-10)).float())
+        self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(real_init))).float())
         # self.decays = nn.Parameter(torch.full_like(self.frequencies, np.log(np.abs(0.00001) * scaling +1e-10)).float()) ##FIXFIXFIX
 
         if do_final_linear:
@@ -257,8 +271,7 @@ class SimpleState(nn.Module):
 
         # input is now B L H
         B, L, H = input.size()
-
-        assert(initial_state is None or not self.do_output_state, "providing an initial_state is incompatible with skipping state output")
+        assert ((initial_state is None) or (self.do_output_state)), "providing an initial_state is incompatible with skipping state output"
         # TODO this shouldn't actually be incompatible...
 
         # if initial_state is None:
@@ -319,7 +332,8 @@ class SimpleState(nn.Module):
 
         if self.do_output_state:
             kernel = kernel.unsqueeze(0)
-            u = einsum('b l h, h n -> b l h n', input, self.in_projection) # [B L H N]
+            complex_in = _r2c(self.in_projection)
+            u = einsum('b l h, h n -> b l h n', input, complex_in) # [B L H N]
             # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_state
 
             if initial_state is not None:
@@ -340,8 +354,8 @@ class SimpleState(nn.Module):
         else:
             # if we don't care to output the states, then we can pre-multiply the kernel by the
             # input and output projections to save memory in the fft.
-            complex_in = self.in_projection + 0j
-            complex_out = self.out_projection + 0j
+            complex_in = _r2c(self.in_projection)
+            complex_out = _r2c(self.out_projection)
             kernel = einsum('h n, k n, n h -> h k', complex_in, kernel, complex_out)
             kernel = kernel.unsqueeze(-1) # [h k 1]
             kernel = kernel.real
@@ -375,7 +389,7 @@ class SimpleState(nn.Module):
 
         if self.do_output_state:
             final_state = conv[:, :, -1, :].unsqueeze(2) # [B, H, 1, N] -> [B, H, N]
-            complex_out = self.out_projection + 0j
+            complex_out = _r2c(self.out_projection)
             output = einsum('b h l n, n h -> b l h', conv, complex_out).real
         else:
             final_state = None
@@ -385,7 +399,7 @@ class SimpleState(nn.Module):
         # output = conv.real @ self.out_projection     # [B, L, H]
 
         if self.do_final_linear:
-            output = F.gelu(self.final_linear(output))
+            output = F.gelu(self.final_linear(F.gelu(output)))
 
         if self.transposed:
             output = output.transpose(-2, -1)  #[B, L, H] -> [B, H, L]
@@ -424,7 +438,9 @@ class SimpleState(nn.Module):
 
 
         # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_states
-        u = einsum('b l h, h n -> b h l n', input, self.in_projection) # [B H L N], N is d_state, H is input dimension.
+        complex_in = _r2c(self.in_projection)
+        input = input + 0j
+        u = einsum('b l h, h n -> b h l n', input, complex_in) # [B H L N], N is d_state, H is input dimension.
 
         propogator = get_propogator(self.frequencies, self.decays, self.scaling) # [N]
         # print("propogator: ", propogator)
@@ -483,13 +499,13 @@ class SimpleState(nn.Module):
             current_state = torch.concat((state_forward, final_state_backward), -1) # [B, H, 1, N]
 
 
-        complex_out = self.out_projection + 0j
+        complex_out = _r2c(self.out_projection)# + 0j
         output = einsum('b h l n, n h -> b l h', output, complex_out).real
 
         #output @ self.out_projection  # [B, L, N] @ [N, H] -> [B, L, H]
 
         if self.do_final_linear:
-            output = F.gelu(self.final_linear(output))
+            output = F.gelu(self.final_linear(F.gelu(output)))
 
         if self.transposed:
             output = output.transpose(-2, -1)  # [B, L, H] -> [B, H, L]
@@ -721,6 +737,25 @@ def test_no_error():
     y = gated(x)
 
 
+def test_dss_vs_ss():
+
+    B = 10
+    H = 15
+    N = 20
+    L = 30
+
+    dss = DSS(H, N, transposed=True,do_final_linear=True)
+
+    ss = SimpleState(H, N, transposed=True, do_final_linear=True,freq_init_mode='hippo_skew_pos')
+    
+    ss.out_projection = nn.Parameter(rearrange(dss.W,'h n s -> n h s'))
+    ss.final_linear = dss.final_linear
+
+    x = torch.randn(B, H, L)
+    y_dss,_ = dss(x)
+    y_ss,_ = ss(x)
+
+    assert torch.allclose(y_dss, y_ss, atol=1e-4)
 
 
 def test_simplestate():
@@ -806,6 +841,8 @@ if __name__=='__main__':
     test_no_error()
 
     test_simplestate()
+
+    test_dss_vs_ss()
 
     B = 3
     C = 2
