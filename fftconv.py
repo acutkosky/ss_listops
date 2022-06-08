@@ -216,7 +216,7 @@ class SimpleState(nn.Module):
         if train_in_proj:
             self.in_projection = nn.Parameter(_c2r(torch.ones(d_model, d_state) + 0j))
         else:
-            self.in_projection = _c2r(torch.ones(d_model, d_state) + 0j)
+            self.in_projection = self.register_buffer('in_projection', _c2r(torch.ones(d_model, d_state) + 0j))
     
         self.out_projection = nn.Parameter(torch.randn(d_state, d_model, 2))
         # self.in_projection = nn.Parameter(torch.ones(d_model, d_state))  ##FIXFIXFIXFIX
