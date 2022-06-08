@@ -126,14 +126,14 @@ class DSS(nn.Module):
         return y, None
 
 
-def get_propogator(frequencies, decays):
-    frequencies = frequencies * 2 * torch.pi
+def get_propogator(frequencies, decays, scaling):
+    frequencies = frequencies * 2 * torch.pi * scaling
     exponents = torch.complex(-torch.exp(decays), frequencies)
     return torch.exp(exponents)
 
 def get_kernel(frequencies, decays, length, scaling):
-    frequencies = frequencies * 2 * torch.pi
-    decays = -torch.exp(decays)
+    frequencies = frequencies * 2 * torch.pi * scaling
+    decays = -torch.exp(decays) * scaling
     exponents = torch.complex(decays, frequencies)
 
     exponents = exponents.unsqueeze(0).tile((length, 1)) # [N] -> [L, N]
@@ -177,8 +177,8 @@ class SimpleState(nn.Module):
         # self.out_projection = nn.Parameter(torch.ones(d_state, d_model))  ##FIXFIXFIXFIX
         # self.default_initial = nn.Parameter(torch.zeros(d_model, d_state)) ##FIXFIXFIXFIX
 
-        self.frequencies = torch.rand(d_star) #hippo_skew_evals(2*d_state)[:d_state].imag
-        self.scaling = nn.Parameter(torch.ones_like(self.frequencies) * scaling)
+        self.frequencies = torch.rand(d_state)/scaling #hippo_skew_evals(2*d_state)[:d_state].imag
+        self.scaling = scaling#nn.Parameter(torch.ones_like(self.frequencies) * scaling)
         #self.frequencies = self.frequencies * scaling
         #self.frequencies = -torch.log(1.0/torch.rand(d_state)-1)
         # self.frequencies = torch.zeros(d_state)                       # fix fix fix fix
@@ -361,15 +361,16 @@ class SimpleState(nn.Module):
 
 
         if initial_state is None:
-            initial_state = self.default_initial.tile((B, 1, 1)) # [H, N] -> [B, H, N]
-
-        initial_state = initial_state.unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
+            initial_state = 0.0
+        #self.default_initial.tile((B, 1, 1)) # [H, N] -> [B, H, N]
+        else:
+            initial_state = initial_state.unsqueeze(2) # [B, H, N] -> [B, H, 1, N]
 
 
         # u = input @ self.in_projection # [B L H] -> [B L N], where N is d_states
         u = einsum('b l h, h n -> b h l n', input, self.in_projection) # [B H L N], N is d_state, H is input dimension.
 
-        propogator = get_propogator(self.frequencies, self.decays) # [N]
+        propogator = get_propogator(self.frequencies, self.decays, self.scaling) # [N]
         # print("propogator: ", propogator)
         # print("u: ", u)
         # print("initial state: ", initial_state)
@@ -378,7 +379,7 @@ class SimpleState(nn.Module):
             # I'm sure there is a "right" way to do this, but this is what we're
             # doing right now because I never really got the hand of not
             # using for loops...
-            current_state = 0.0#initial_state
+            current_state = initial_state
             output = []
             for idx in range(L):
                 propogated_state = current_state * propogator # [B, H, 1, N] * [N] -> [B, H, 1, N]
