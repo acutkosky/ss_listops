@@ -6,6 +6,8 @@ from einops import rearrange, repeat
 import opt_einsum as oe
 import math
 
+# main class in here is "SimpleState" probably.
+
 einsum = contract = oe.contract
 contract_expression = oe.contract_expression
 
