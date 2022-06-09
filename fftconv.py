@@ -20,9 +20,9 @@ def hippo_skew_evals(N):
     # decreasing order of imag
     return evals[evals.imag.argsort(descending=True)]               # [N]
 
-# implementation of dss more faithful to original code. simplified a bit though
-# to remove some options that seem unneeded for good performance.
-# in particular, we may assume:
+# implementation of dss more faithful to original code at https://github.com/ag1988/dss.
+# Simplified a bit though to remove some options that seem unneeded for good performance.
+# in particular, we assume:
 # bidirectional is false
 # version is exp
 # initial is hippo_skew_eval
@@ -112,7 +112,11 @@ class DSS(nn.Module):
 
 
         return y, None
+#####################3
 
+# Following code is for a different reimplementation of the state-space mode
+# it seems a little more flexible and exposes the underlying ideas a bit better
+# IMO.
 
 def get_propogator(frequencies, decays, scaling):
     frequencies = frequencies * scaling
@@ -133,7 +137,90 @@ def get_kernel(frequencies, decays, length, scaling):
 
     return exponents
 
+class LASSO(nn.Module):
+    '''
+    layer based on gating (https://arxiv.org/pdf/2202.10447.pdf)
+    that is apparently much faster on TPUs and also has good length
+    generalization properties according to Harsh Mehta.
+    '''
+    def __init__(self,
+                 d_embed,
+                 d_state,
+                 d_in_project=None,
+                 d_out_project=None,
+                 transposed=False,
+                 activation='gelu',
+                 **simple_state_args):
+        super().__init__()
+
+        self.d_embed = d_embed
+        self.d_state = d_state
+        self.transposed = transposed
+
+        if d_in_project is None:
+            d_in_project = self.d_embed
+        if d_out_project is None:
+            d_out_project = self.d_embed
+
+        self.d_in_project = d_in_project
+        self.d_out_project = d_out_project
+
+
+        self.in_project = nn.Linear(d_embed, d_in_project)
+        self.ss = SimpleState(d_in_project, d_state, transposed=False, **simple_state_args)
+        self.out_project = nn.Linear(d_in_project, d_out_project)
+
+        self.gate_linear = nn.Linear(d_embed, d_out_project)
+
+        self.final_linear = nn.Linear(d_out_project, d_embed)
+
+        if activation == 'gelu':
+            self.activation = F.gelu
+        elif activation == 'relu':
+            self.activation = F.relu
+        elif activation == 'none' or activation is None:
+            self.activation = lambda x: x
+        else:
+            raise TypeError(f'unsupported activation: {activation}')
+
+    def forward(self, x):
+        '''
+        x: B H L if transposed, B L H otherwise, where B=batch, H=hidden size (i.e. embedding dim)
+            and L = sequence length
+
+        returns
+        output: same shape as x
+        '''
+        if self.transposed:
+            x = x.transpose(-2, -1)
+        # x is now [B L H]
+
+        gate = self.gate_linear(x) # [B L O]
+        gate = self.activation(gate) # [B L O]
+
+        ss_input = self.in_project(x) # [B L I]
+        ss_input = self.activation(ss_input) # [B L I]
+
+        ss_output, _ = self.ss(ss_input)  # [B L I]
+
+        projected_output = self.out_project(ss_output) # [B L O]
+
+        gated_output = gate * projected_output # [B L O]
+
+        result = self.final_linear(gated_output) # [B L H]
+
+        if self.transposed:
+            result = result.transpose(-2, -1) # [B L H] -> [B H L]
+
+        return result
+
+        
+
 class GatedStateUnit(nn.Module):
+    '''
+    class based on https://arxiv.org/pdf/2202.10447.pdf.
+    not sure if this is a good idea.
+    '''
     def __init__(self,
                  d_embed,
                  d_state,
@@ -148,11 +235,19 @@ class GatedStateUnit(nn.Module):
         self.transposed = transposed
 
         self.gate_linear = torch.nn.Linear(d_embed, d_embed)
-        self.state_space_layer = SimpleState(d_embed, d_state, transposed=False, do_output_state=False, **simple_state_args)
+        self.state_space_layer = SimpleState(d_embed, d_state, transposed=False, do_output_state=do_output_state, **simple_state_args)
 
         self.final_linear = torch.nn.Linear(d_embed, d_embed)
 
     def forward(self, x):
+        '''
+        x: B H L if transposed, B L H otherwise, where B=batch, H=hidden size (i.e. embedding dim)
+            and L = sequence length
+
+        returns
+        output: same shape as x
+        final_state: currently probably should not use this.
+        '''
         if self.transposed:
             x = x.transpose(-2, -1)
         gate = F.gelu(self.gate_linear(x))
@@ -339,12 +434,15 @@ class SimpleState(nn.Module):
             u = rearrange(u, 'b l h s -> b h l s') # [B L H 1] -> [B H L 1]
 
 
-        # we use full fft rather than real fft since we don't constrain our
-        # frequencies to be the eigenvalues of a real matrix...
-        # we could instead take the real part of the kernel first,
-        # but this will allow us to propogate the state as well as the output since
-        # the state is imaginary.
-        u_f = torch.fft.fft(u, n=fft_len, dim=-2)  # [B H K N] -> [B H F N] F=fft_len OR [B H F 1] -> [B H F 1]
+        # we use full fft rather than real fft since we don't constrain matrices
+        # to be real, which makes the state an imaginary value.
+        # Of course, in the end we only need a real output for the final output
+        # so if we don't need to output the state we could just use a real fft,
+        # which is half the size. TODO: make this optimization.
+
+        # shape annotations are written with do_output_state=True first, and do_output_state=False second.
+
+        u_f = torch.fft.fft(u, n=fft_len, dim=-2)  # [B H L N] -> [B H F N] F=fft_len OR [B H F 1] -> [B H F 1]
         kernel_f = torch.fft.fft(kernel, n=fft_len, dim=-2) # [H F N] -> [H F N] OR [H F 1] -> [H F 1]
 
         conv_f = u_f * kernel_f # [B H F N] * [1 F N] -> [B H F N] OR [B H F 1] * [H F 1] -> [B H F 1]
@@ -696,6 +794,9 @@ def test_no_error():
 
     gated = GatedStateUnit(H, N, transposed=True)
     y = gated(x)
+
+    lasso = LASSO(H, N, transposed=True)
+    y = lasso(x)
 
 
 def test_dss_vs_ss():
