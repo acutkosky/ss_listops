@@ -190,6 +190,7 @@ class LASSO(nn.Module):
 
         returns
         output: same shape as x
+        final state: probably should ignore this for now
         '''
         if self.transposed:
             x = x.transpose(-2, -1)
@@ -201,7 +202,7 @@ class LASSO(nn.Module):
         ss_input = self.in_project(x) # [B L I]
         ss_input = self.activation(ss_input) # [B L I]
 
-        ss_output, _ = self.ss(ss_input)  # [B L I]
+        ss_output, final_state = self.ss(ss_input)  # [B L I]
 
         projected_output = self.out_project(ss_output) # [B L O]
 
@@ -212,7 +213,7 @@ class LASSO(nn.Module):
         if self.transposed:
             result = result.transpose(-2, -1) # [B L H] -> [B H L]
 
-        return result
+        return result, final_state
 
         
 
